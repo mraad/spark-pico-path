@@ -1,2 +1,8 @@
 *.class
 *.log
+*.iml
+target/
+project/target/
+Miami.gdb/
+.idea/
+*.sh

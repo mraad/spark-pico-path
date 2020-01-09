@@ -3,6 +3,7 @@ package com.esri
 import com.esri.gdb._
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types._
 import org.apache.spark.sql.{SaveMode, SparkSession}
 
 object PicoCellApp extends App {
@@ -14,6 +15,9 @@ object PicoCellApp extends App {
     import spark.implicits._
 
     val conf = spark.sparkContext.getConf
+    conf.set("spark.sql.session.timeZone", "UTC")
+    val inputFormat: String = conf.get("spark.app.input.format", "gdb")
+
     val inputPath = conf.get("spark.app.input.path", "Miami.gdb")
     val inputName = conf.get("spark.app.input.name", "Broadcast")
     val outputPath = conf.get("spark.app.output.path", "/tmp/cells")
@@ -28,64 +32,91 @@ object PicoCellApp extends App {
     val velMax = conf.getDouble("spark.app.max.vel", 55.0)
     val minPop = conf.getInt("spark.app.min.pop", 1)
 
-    spark
-      .read
-      .gdb(inputPath, inputName)
-      .select(
-        $"MMSI".as("id"),
-        $"BaseDateTime".as("pt"),
-        $"Shape.x".as("px"),
-        $"Shape.y".as("py"))
-      .where("status = 0") // 0 = under way using engine
-      .createTempView("tmp")
+    val tmp = inputFormat.toLowerCase match {
+      case "ais_csv" =>
+        val schema = new StructType()
+            .add("MMSI", IntegerType)
+            .add("BaseDateTime", TimestampType)
+            .add("LAT", FloatType)
+            .add("LON", FloatType)
+
+            .add("SOG", StringType)
+            .add("COG", StringType)
+            .add("Heading", StringType)
+            .add("VesselName", StringType)
+            .add("IMO", StringType)
+            .add("CallSign", StringType)
+            .add("VesselType", StringType)
+
+            .add("Status", StringType)
+
+            .add("Length", StringType)
+            .add("Width", StringType)
+            .add("Draft", StringType)
+            .add("Cargo", StringType)
+        val input_df = spark.read
+            .schema(schema)
+            .option("header", "true")
+            .csv(inputPath)
+        input_df
+            .select(
+              $"MMSI".as("id"),
+              $"BaseDateTime".as("pt"),
+              $"LON".as("px"),
+              $"LAT".as("py"))
+            .filter($"Status" === "under way using engine")
+      case "gdb" =>
+        spark
+            .read
+            .gdb(inputPath, inputName)
+            .select(
+              $"MMSI".as("id"),
+              $"BaseDateTime".as("pt"),
+              $"Shape.x".as("px"),
+              $"Shape.y".as("py"))
+            .where("status = 0") // 0 = under way using engine
+      case unsupported =>
+        Console.err.println(s"unsupported input format: $unsupported, only 'ais_csv' and 'gdb' are available ")
+        sys.exit(1)
+    }
 
     val ws = Window.partitionBy("id").orderBy("pt")
 
-    spark
-      .sql("select id,pt,px,py from tmp")
-      .withColumn("nt", lead("pt", 1).over(ws))
-      .withColumn("nx", lead("px", 1).over(ws))
-      .withColumn("ny", lead("py", 1).over(ws))
-      .filter("pt is not null and nt is not null and pt < nt") // pt < nt is to ensure positive movement.
-      .as[PicoPath]
-      .flatMap(pp => {
-        val prevTime = pp.pt.getTime
-        val nextTime = pp.nt.getTime
-        val sec = (nextTime - prevTime) / 1000L
-        if (secMin < sec && sec < secMax) {
-          val dist = Haversine.distance(pp.py, pp.px, pp.ny, pp.nx)
-          if (distMin < dist && dist < distMax) {
-            val vel = 3.6 * dist / sec
-            if (velMin < vel && vel < velMax) {
-              val dy = pp.ny - pp.py
-              val dx = pp.nx - pp.px
-              val deg = math.atan2(dy, dx).toDegrees
-              val col = math.floor((pp.px + pp.nx) * 0.5 / cellSize).toLong
-              val row = math.floor((pp.py + pp.ny) * 0.5 / cellSize).toLong
-              Some(PicoCell(col, row, pp.pt, vel, deg))
-            }
-            else {
-              None
-            }
-          } else {
-            None
-          }
-        }
-        else {
-          None
-        }
-      })
-      .createTempView("qr")
+    val dLat = ($"ny" - $"py") / 180 * math.Pi
+    val dLon = ($"nx" - $"px") / 180 * math.Pi
+    val dy = sin(dLat * 0.5)
+    val dx = sin(dLon * 0.5)
+    val a = dy * dy + dx * dx * cos($"py" / 180 * math.Pi) * cos($"ny" / 180 * math.Pi)
+    val R2 = 2.0 * 6371008.8 // meters
+    val dist = asin(sqrt(a)) * R2
+
+    tmp
+        .withColumn("nt", lead("pt", 1).over(ws))
+        .withColumn("nx", lead("px", 1).over(ws))
+        .withColumn("ny", lead("py", 1).over(ws))
+        .withColumn("prev_time", unix_timestamp($"pt"))
+        .withColumn("next_time", unix_timestamp($"nt"))
+        .withColumn("sec", $"next_time" - $"prev_time")
+        .filter($"sec" > secMin && $"sec" < secMax)
+        .withColumn("dist", dist)
+        .filter($"dist" > distMin && $"dist" < distMax)
+        .withColumn("vel", ($"dist" / $"sec") * 3.6)
+        .filter($"vel" > velMin && $"vel" < velMax)
+        .withColumn("deg", atan2($"ny" - $"py", $"nx" - $"px") / math.Pi * 180)
+        .withColumn("col", floor(($"nx" + $"px") * 0.5 / cellSize).cast(LongType))
+        .withColumn("row", floor(($"ny" + $"py") * 0.5 / cellSize).cast(LongType))
+        .select($"col" as "q", $"row" as "r", $"pt" as "ts", $"vel", $"deg")
+        .createTempView("qr")
 
     val sql =
       s"""
          |select
-         | q * $cellSize + $cellHalf as x
-         |,r * $cellSize + $cellHalf as y
+         |q * ${cellSize}d + ${cellHalf}d as x
+         |,r * ${cellSize}d + ${cellHalf}d as y
          |,hour(ts) as hh
          |,count(1) as pop
-         |,round(avg(vel)) as vel
-         |,round(avg(deg)) as deg
+         |,floor(avg(vel)) as vel
+         |,floor(avg(deg)) as deg
          | from qr
          | group by q,r,hour(ts)
          | having pop >= $minPop
